@@ -1,0 +1,812 @@
+<?php
+
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Cache\RefinableCacheableDependencyInterface;
+use Drupal\Core\Entity\Display\EntityViewDisplayInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Url;
+use Drupal\profile\Entity\Profile;
+use Drupal\user\Entity\Role;
+use Drupal\user\Entity\User;
+use Drupal\views\ViewExecutable;
+
+/**
+ * @file
+ * Primary module hooks for MBGNA Tweaks module.
+ */
+
+/**
+ * Implements hook_form_alter()
+ *
+ * Change some view filter form settings to simplify the display
+ * for better user experience.
+ */
+function mbgna_tweaks_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  $route_name = \Drupal::routeMatch()->getRouteName();
+  $current_user = \Drupal::currentUser();
+
+  if ($form['#id'] === 'protected-pages-enter-password') {
+    $form['#attributes']['class'][] = 'container-squeeze';
+    $form['#attributes']['class'][] = 'container-white';
+  }
+
+  // Drupal commerce promotional coupons and commerce_checkout_order_fields do not
+  // play along, entering coupon codes does not update totals when extra order
+  // fields are present. So, let's keep the extra fields on the "order_information" step
+  // and suppress the coupon sidebar pane, and only show that on the "review" step.
+  if ($form['#id'] === 'commerce-checkout-flow-multistep-default') {
+    if ($form['#step_id'] === 'order_information') {
+      unset($form['sidebar']['coupon_redemption']);
+      $form['sidebar']['coupon_notice'] = array(
+        '#type' => 'markup',
+        '#markup' => '<div class="checkout-pane-coupon-redemption"><div id="edit-sidebar-coupon-redemption-form"><h5>Coupon code</h5><p class="small">If you have any coupon code(s) you can add them at the next checkout step.</p></div></div>',
+      );
+    }
+  }
+
+  // Class dates are complicated enough as it is. Recurring dates requires a multiple date
+  // field, and can use an individual date to specify entire ranges of dates. This is already
+  // rather powerful. Currently, we can select which days a class occurs, the time (applies 
+  // to all dates), how it repeats, and when the class conculdes.
+  // 
+  // There may be more complicated cases where a class meets on multiple days at differing 
+  // times. This gets messy fast, and is far out of scope with what
+  // was proposed: a simple class registration function.
+  // 
+  // If the website needs more date detail work, we will provide an open text field. There
+  // could be all manner of permuations, notes, and non-systemicatic dating.
+  if ($form['#id'] === 'commerce-product-variation-class-edit-form' || $form['#id'] === 'commerce-product-variation-class-add-form') {
+    if ($form['field_dates_recur']) {
+      $form['field_dates_recur']['widget']['add_more']['#access'] = FALSE; // Disable the "Add another item" button.
+    } 
+  }
+
+  // Disable DXPR editing for new registrations.
+  if ($current_user->id() != 1 && array_key_exists('dxpr_user_is_disavowed', $form)) {
+    $form['dxpr_user_is_disavowed']['widget']['value']['#default_value'] = 1;
+    $form['dxpr_user_is_disavowed']['#access'] = FALSE;
+  }
+
+  // Load the user being viewed, if being viewed.
+  if (\Drupal::routeMatch()->getParameter('user')) {
+    // Attempt loading the full user account from the url.
+    $account = \Drupal::routeMatch()->getParameter('user');
+
+    if (!is_object($account) && (int) $account > 0) {
+      // Some pages such as add payment method, the user parameter
+      // is simply a string uid!
+      $account_uid = \Drupal::routeMatch()->getParameter('user');
+    }
+    else if (is_object($account) && method_exists($account, 'id')) {
+      // On other pages such as edit profile, the user parameter
+      // is the actual user object!
+      $account_uid = \Drupal::routeMatch()->getParameter('user')->id();
+    }
+
+    // Now we can load the account.
+    $account_user = User::load($account_uid);
+
+    // Create the "back" links.
+    $back_to_dash_url = Url::fromRoute('entity.user.canonical', ['user' => $account_uid]);
+    $back_to_payments_url = Url::fromRoute('entity.commerce_payment_method.collection', ['user' => $account_uid]);
+    $back_to_addresses_url = Url::fromRoute('commerce_order.address_book.overview', ['user' => $account_uid]);
+
+    // Insert directly into a a form field element.
+    $back_to_dash_link = array(
+      '#type' => 'link',
+      '#url' => $back_to_dash_url,
+      '#title' => t('&larr; My dashboard'),
+      '#weight' => -99,
+    );
+
+    // Insert directly into a a form field element.
+    $back_to_payments_link = array(
+      '#type' => 'link',
+      '#url' => $back_to_payments_url,
+      '#title' => t('&larr; My payment methods'),
+      '#weight' => -99,
+    );
+
+    // Insert directly into a a form field element.
+    $back_to_addresses_link = array(
+      '#type' => 'link',
+      '#url' => $back_to_addresses_url,
+      '#title' => t('&larr; My addresses'),
+      '#weight' => -99,
+    );
+  }
+
+  // Select all products_mbgna views.
+  if (substr($form['#id'], 0, 33) === 'views-exposed-form-products-mbgna') {
+    $form['category']['#options']['All'] = t('Category...');
+  }
+  
+  // Style search input.
+  if ($form['#id'] === 'search-form') {
+    $form['#attributes']['class'][] = 'container-white';
+    $form['#attributes']['class'][] = 'container-squeeze';
+  }
+
+  // Style checkout panes.
+  if (substr($form['#id'], 0, -8) === 'commerce-checkout-flow-multistep') {
+    $form['#attributes']['class'][] = 'container-white';
+    $form['#attributes']['class'][] = 'container-squeeze';
+  }
+
+  // Target all shopping cart forms.
+  if (substr($form['#id'], 0, 37) === 'views-form-commerce-cart-form-default') {
+    // Get the cart order type;
+    $cart_view = $form['output'][0]['#view'];
+    foreach ($cart_view->result as $row_id => $row) {
+      foreach ($cart_view->field as $field_id => $field ) {
+        if ($field_id === 'type') {
+          $shopping_cart_order_type = $field->getValue($row);
+          $cart_title = 'My shopping cart';
+          // Pluralize when appropriate.
+          if ($shopping_cart_order_type != 'default' && 
+            $shopping_cart_order_type != 'merchandise' &&
+            $shopping_cart_order_type != 'class') {
+            $cart_title = ucfirst($shopping_cart_order_type). 's shopping cart';
+          } elseif ($shopping_cart_order_type === 'class') {
+            // "Class" uses "es" when pluralized.
+            $cart_title = ucfirst($shopping_cart_order_type). 'es shopping cart';
+          } elseif ($shopping_cart_order_type === 'merchandise') {
+            // "Merchandise" is already pluralized.
+            $cart_title = ucfirst($shopping_cart_order_type). ' shopping cart';
+          }
+        }
+      }
+    }
+
+    $markup = '<h1 class="page-title">'. t($cart_title) .'</h1>';
+    $form['title'] = array(
+      '#type' => 'markup',
+      '#markup' => $markup,
+      '#weight' => -98,
+    );
+
+    // Shopping cart "back" links can only use the 
+    // current user, not the profile account being viewed.
+    if ($current_user->id() > 0) {
+      $form['back_to_dash_link'] = array(
+        '#type' => 'link',
+        '#url' => Url::fromRoute('entity.user.canonical', ['user' => $current_user->id()]),
+        '#title' => t('&larr; My dashboard'),
+        '#weight' => -99,
+      );
+    }
+
+    $form['#attributes']['class'][] = 'container-white';
+    $form['#attributes']['class'][] = 'container-squeeze';
+  }
+
+  // Add titles to "add to cart" blocks;
+  if (substr($form['#id'], 0, 54) === 'commerce-order-item-add-to-cart-form-commerce-product-') {
+    $type = NULL;
+
+    if ($route_name === 'entity.commerce_product.canonical') {
+      if ($product = \Drupal::routeMatch()->getParameter('commerce_product')) {
+        $type = $product->type->getValue()[0]['target_id'];
+      }
+    }
+
+    if ($route_name === 'entity.node.canonical' || $route_name === 'entity.plant.canonical') {
+      if ($node = \Drupal::routeMatch()->getParameter('node')) {
+        $type = $node->getType();
+      }
+    }
+
+    switch ($type) {
+      case 'admission':
+        $markup = t('<h5>Register</h5>');
+        // Change out of stock label while we're here.
+        if ($form['actions']['submit']['#value']->render() === 'Out of stock') {
+          $form['actions']['submit']['#value'] = t('Full &#x00d7;'); // Add an "X" after label text.
+        }
+        break;
+      case 'class':
+        $markup = t('<h5>Register</h5>');
+        // Change out of stock label while we're here.
+        if ($form['actions']['submit']['#value']->render() === 'Out of stock') {
+          $form['actions']['submit']['#value'] = t('Full &#x00d7;'); // Add an "X" after label text.
+        }
+        break;
+      case 'merchandise':
+        $markup = t('<h4>Purchase</h4>');
+        break;
+      case 'plant':
+        $markup = t('<h4>Purchase</h4>');
+        break;
+      default:
+        $markup = t('<h4>Purchase</h4>');
+        break;
+    }
+
+    $form['title'] = array(
+      '#type' => 'markup',
+      '#markup' => $markup,
+      '#weight' => -99,
+    );
+  }
+
+  // Payment method add/edit form
+  if ($form['#id'] === 'commerce-payment-method-add-form' || $form['#id'] === 'commerce-payment-method-credit-card-edit-form') {
+    $form['back_to_payments_link'] = $back_to_payments_link;
+
+    if ($form['#id'] === 'commerce-payment-method-credit-card-edit-form') {
+      $page_title = t('Edit payment method');  
+    }
+
+    if ($form['#id'] === 'commerce-payment-method-add-form') {
+      $page_title = t('Add payment method');  
+    }
+    
+    $form['title'] = array(
+      '#type' => 'markup',
+      '#markup' => '<h1 class="page-title">'. $page_title .'</h1>',
+      '#weight' => -1,
+    );
+  }
+
+  // Address book add/edit form
+  if ($form['#id'] === 'profile-customer-address-book-edit-form' || $form['#id'] === 'profile-customer-address-book-add-form' ) {
+    $form['back_to_addresses_link'] = $back_to_addresses_link;
+
+    if ($form['#id'] === 'profile-customer-address-book-edit-form') {
+      $page_title = t('Edit address');  
+    }
+
+    if ($form['#id'] === 'profile-customer-address-book-add-form') {
+      $page_title = t('Add address');  
+    }
+    
+    $form['title'] = array(
+      '#type' => 'markup',
+      '#markup' => '<h1 class="page-title">'. $page_title .'</h1>',
+      '#weight' => -1,
+    );
+  }
+
+  // Personal profile add/edit form.
+  if ($form['#id'] === 'profile-personal-add-form' || $form['#id'] === 'profile-personal-edit-form') {
+    $form['back_to_dash_link'] = $back_to_dash_link;
+    $page_title = t('My profile');
+    $form['title'] = array(
+      '#type' => 'markup',
+      '#markup' => '<h1 class="page-title">'. $page_title .'</h1>',
+      '#weight' => -1,
+    );
+    $form['field_realname_prefix']['widget']['#options']['_none'] = 'Prefix...';
+    $form['field_realname_suffix']['widget']['#options']['_none'] = 'Suffix...';
+    $form['field_bio']['widget'][0]['#placeholder'] = 'Short biography...';
+    $form['field_public_email']['widget'][0]['value']['#placeholder'] = 'Public email...';
+
+    // Loop through all fields and remove titles from
+    // form widgets.
+    foreach ($form as $key => $value) {
+      if (substr($key, 0, 6) === 'field_') {
+        if (array_key_exists('#title', $form[$key]['widget'])) {
+          $form[$key]['widget']['#title_display'] = 'invisible';
+          
+          if (array_key_exists(0, $form[$key]['widget']) && array_key_exists('#title', $form[$key]['widget'][0])) {
+            $form[$key]['widget'][0]['#title_display'] = 'invisible';
+
+            if (array_key_exists('value', $form[$key]['widget'][0]) && array_key_exists('#title', $form[$key]['widget'][0]['value'])) {
+              $form[$key]['widget'][0]['value']['#title_display'] = 'invisible';
+            }
+          }
+        }
+      }
+    }
+
+    // Clear the user_view cache.
+    array_unshift($form['actions']['submit']['#submit'], 'clear_profile_cache_on_submit');
+  }
+
+  // User account create/edit form.
+  if ($form['#id'] === 'user-form' || $form['#id'] === 'user-register-form') {
+
+    // Invalidate cache when submitting the form.
+    if ($form['#id'] == 'user-form') {
+      array_unshift($form['actions']['submit']['#submit'], 'clear_user_cache_on_submit');
+    }
+
+    // Some pages like user-create cannot have a $back_to_dash_link.
+    // Also the link should not appear on a password reset page.
+    if (isset($back_to_dash_link) && !\Drupal::request()->get('pass-reset-token')) {
+      // Add a "back" link.
+      $form['back_to_dash_link'] = $back_to_dash_link;
+    }
+
+    // Modify the title of the account form depending
+    // on if the current user is an existing account
+    // or if it is anonymous.
+    if ($current_user->id()) {
+      $page_title = t('My account');
+    } else {
+      $page_title = t('Create an account');
+    }
+    $form['title'] = array(
+      '#type' => 'markup',
+      '#markup' => '<h1 class="page-title">'. $page_title .'</h1>',
+      '#weight' => -98,
+    );
+
+    // Email
+    $form['account']['mail']['#weight'] = 1;
+    $form['account']['mail']['#placeholder'] = t('Email...');
+    $form['account']['mail']['#label_classes'] = ['visually-hidden'];
+
+    // Username
+    $form['account']['name']['#weight'] = 2;
+    $form['account']['name']['#placeholder'] = t('Username');
+    $form['account']['name']['#label_classes'] = ['visually-hidden'];
+
+    // Password and confirmation
+    // This field is not easily editable. Use javascript to
+    // hide the labels and set the placeholders.
+    $form['account']['pass']['#weight'] = 8;
+
+    // Current password
+    $form['account']['current_pass']['#weight'] = 9;
+    $form['account']['current_pass']['#placeholder'] = t('Current password...');
+    $form['account']['current_pass']['#label_classes'] = ['visually-hidden'];
+    $form['account']['current_pass']['#description'] = t('Required to change <em class="placeholder">email</em> or <em class="placeholder">password</em>. <a href="/user/password" title="Send password reset instructions via email.">Reset your password</a>.');
+
+    // Name prefix
+    $form['account']['field_realname_prefix'] = $form['field_realname_prefix'];
+    $form['account']['field_realname_prefix']['widget']['#options']['_none'] = 'Name prefix...';
+    $form['account']['field_realname_prefix']['widget']['#title_display'] = 'invisible';
+    $form['account']['field_realname_prefix']['#weight'] = 3;
+    unset($form['field_realname_prefix']);
+
+    // First name
+    $form['account']['field_realname_first'] = $form['field_realname_first'];
+    $form['account']['field_realname_first']['#weight'] = 4;
+    $form['account']['field_realname_first']['widget'][0]['value']['#placeholder'] = t('First name...');
+    $form['account']['field_realname_first']['widget'][0]['value']['#label_classes'] = ['visually-hidden'];
+    unset($form['field_realname_first']);
+
+    // Middle name
+    $form['account']['field_realname_middle'] = $form['field_realname_middle'];
+    $form['account']['field_realname_middle']['#weight'] = 5;
+    $form['account']['field_realname_middle']['widget'][0]['value']['#placeholder'] = t('M.I.');
+    $form['account']['field_realname_middle']['widget'][0]['value']['#label_classes'] = ['visually-hidden'];
+    unset($form['field_realname_middle']);
+
+    // Last name
+    $form['account']['field_realname_last'] = $form['field_realname_last'];
+    $form['account']['field_realname_last']['#weight'] = 6;
+    $form['account']['field_realname_last']['widget'][0]['value']['#placeholder'] = t('Last name...');
+    $form['account']['field_realname_last']['widget'][0]['value']['#label_classes'] = ['visually-hidden'];
+    unset($form['field_realname_last']);
+
+    // Name suffix
+    $form['account']['field_realname_suffix'] = $form['field_realname_suffix'];
+    $form['account']['field_realname_suffix']['widget']['#options']['_none'] = 'Name suffix...';
+    $form['account']['field_realname_suffix']['widget']['#title_display'] = 'invisible';
+    $form['account']['field_realname_suffix']['#weight'] = 7;
+    unset($form['field_realname_suffix']);
+
+    // Remove descriptions
+    unset($form['account']['mail']['#description']);
+    unset($form['account']['name']['#description']);
+    unset($form['account']['pass']['#description']);
+  }
+
+  // Target ALL checkout flows. Remove last bit of form id that denotes
+  // the type of checkout flow.
+  if (substr($form['#id'], 0, 33) === 'commerce-checkout-flow-multistep-') {
+    $form['login']['register']['dxpr_user_is_disavowed']['widget']['value']['#type'] = 'visually-hidden';
+    $form['login']['register']['dxpr_user_is_disavowed']['widget']['value']['#default_value'] = 1;
+
+    if ($form['#step_id'] === 'order_information') {
+      // Best bet is to send people back to the shopping cart
+      // because they may not have a dashboard, we can't be sure
+      // if the product went directly to checkout, and redirecting
+      // to the front page is too blunt.
+      $form['go_back'] = array(
+        '#type' => 'link',
+        '#url' => Url::fromRoute('commerce_cart.page'),
+        '#title' => t('&#x00d7; Cancel'),
+        '#weight' => -99,
+      );
+
+      // Custom checkout fields from order types.
+      if (array_key_exists('order_fields:checkout', $form) && array_key_exists('field_attendee_name', $form['order_fields:checkout'])) {
+        $form['order_fields:checkout']['field_attendee_name']['widget'][0]['value']['#placeholder'] = $form['order_fields:checkout']['field_attendee_name']['widget'][0]['value']['#title'] . '...';
+        $form['order_fields:checkout']['field_attendee_name']['widget'][0]['value']['#title_display'] = 'invisible';
+      }
+    }
+
+    // Remove superfluous name fields for quicker registration.
+    // Also disable DXPR editor field.
+    if ($form['#step_id'] === 'complete' && array_key_exists('completion_register', $form)) {
+      $form['completion_register']['field_realname_prefix']['#access'] = FALSE;
+      $form['completion_register']['field_realname_suffix']['#access'] = FALSE;
+      $form['completion_register']['field_realname_middle']['#access'] = FALSE;
+
+      // Put names into a container.
+      $form['completion_register']['realname_full'] = array(
+        '#type' => 'container',
+        'field_realname_first' => $form['completion_register']['field_realname_first'],
+        'field_realname_last' => $form['completion_register']['field_realname_last'],
+      );
+      unset($form['completion_register']['field_realname_first']);
+      unset($form['completion_register']['field_realname_last']);
+
+      // User is dissavowed from DXPR editing.
+      $form['completion_register']['dxpr_user_is_disavowed']['widget']['value']['#type'] = 'visually-hidden';
+      $form['completion_register']['dxpr_user_is_disavowed']['widget']['value']['#default_value'] = 1;
+    }
+  }
+
+  // Set default selection labels for "better select" views filter module.
+  if ($form['#id'] === 'views-exposed-lan-events-page-1') {
+    if (isset($form['categories'])) {
+      $form['categories']['#options']['All'] = t('Select a category...');
+    }
+    if (isset($form['location'])) {
+      $form['location']['#options']['All'] = t('Select a location...');
+    }
+  }
+
+  // Remove min/max labels from date range fields.
+  if ($form['#id'] === 'views-exposed-form-positions-page-1') {
+    $form['type']['#options']['All'] = t('Type of position...');
+    $form['posted']['#title_display'] = 'invisible';
+    // if (isset($form['posted_wrapper'])) {
+    //   $form['posted_wrapper']['posted_wrapper']['posted']['min']['#title_display'] = 'invisible';
+    //   $form['posted_wrapper']['posted_wrapper']['posted']['max']['#title_display'] = 'invisible';
+    // }
+  }
+
+  // Remove min/max labels from date range fields for class products.
+  if ($form['#id'] === 'views-exposed-form-classes-page-1') {
+    if (isset($form['type'])) {
+      $form['type']['#options']['All'] = t('Select a class type...');
+    }
+    if (isset($form['institution'])) {
+      $form['institution']['#options']['All'] = t('Select an institution...');
+    }
+    if (isset($form['dates_wrapper'])) {
+      $form['dates_wrapper']['dates_wrapper']['dates']['min']['#title_display'] = 'invisible';
+      $form['dates_wrapper']['dates_wrapper']['dates']['max']['#title_display'] = 'invisible';
+    }
+  }
+
+  // Remove min/max labels from date range fields for filterable product variations.
+  if ($form['#id'] === 'views-exposed-form-products-mbgna-block-5') {
+    $form['title'] = array(
+      '#type' => 'markup',
+      '#markup' => '<h4>Find Tickets</h4>',
+      '#weight' => -100,
+    );
+
+    if (isset($form['field_date_value_wrapper'])) {
+      // dpm($form);
+      $form['#attributes']['class'][] = 'field boxed-field boxed-field-xlight';
+      $form['field_date_value_wrapper']['field_date_value_wrapper']['field_date_value']['min']['#title'] = 'Occurring after/on';
+      $form['field_date_value_wrapper']['field_date_value_wrapper']['field_date_value']['max']['#title'] = 'Occurring before/on';
+    }
+  }
+
+  if ($form['#id'] === 'profile-customer-address-book-delete-form') {
+    $form['#attributes']['class'][] = 'container-white';
+    $form['#attributes']['class'][] = 'container-squeeze';
+
+    $markup = '<h2>Delete address?</h2>';
+    $form['title'] = array(
+      '#type' => 'markup',
+      '#markup' => $markup,
+      '#weight' => -98,
+    );
+  }
+
+  // Style the container.
+  if ($form['#id'] === 'user-form' || $form['#id'] === 'user-register-form' || $form['#id'] === 'commerce-payment-method-add-form' || $form['#id'] === 'commerce-payment-method-credit-card-edit-form') {
+    $form['#attributes']['class'][] = 'container-white';
+    $form['#attributes']['class'][] = 'container-squeeze';
+  }
+
+  // Rename openid login button.
+  if ($form['#id'] === 'openid-connect-login-form') {
+    $form['openid_connect_client_generic_login']['#value'] = t('Staff');
+  }
+}
+
+// Helper function for form_alter hook that
+// invalidates cache when a user account form
+// is submitted with potential changes.
+function clear_user_cache_on_submit() {
+  $account = \Drupal::routeMatch()->getParameter('user');
+  $uid = $account->id();
+  $cache_tags = ['user:' . $uid];
+  Cache::invalidateTags($cache_tags);
+}
+
+// Helper function for form_alter hook that
+// invalidates cache when a user profile form
+// is submitted with potential changes.
+function clear_profile_cache_on_submit() {
+  $account = \Drupal::routeMatch()->getParameter('user');
+  $uid = $account->id();
+  $cache_tags = ['user_view'];
+  Cache::invalidateTags($cache_tags);
+}
+
+/**
+* Implementation of hook_preprocess_form_element
+* @param $variables
+*/
+function mbgna_tweaks_preprocess_form_element(&$variables) {
+  if (isset($variables['element']['#label_classes'])) {
+    $variables['label']['#attributes']['class'] = $variables['element']['#label_classes'];
+  }
+}
+
+// Helper function for form actions/redirects that allows products to be 
+// "added to cart" but skip the cart and go direct to checkout. Usually the
+// "Add to cart" button label is changed in hook_form_alter() to say something
+// like "Purchase" to reflect the shopping cart is not part of the process.
+// 
+// Set form_alter submit callbacks like this:
+// form['actions']['submit']['#submit'][] = '_redirect_to_checkout';
+function _redirect_to_checkout(&$form, FormStateInterface $form_state) {
+  $cart_id = $form_state->get('cart_id');
+  $url = \Drupal\Core\Url::fromRoute('commerce_checkout.form',
+    ['commerce_order' => $cart_id]
+  );
+  $form_state->setRedirectUrl($url);
+}
+
+/**
+ * Implements hook_library_info_alter()
+ */
+function mbgna_tweaks_library_info_alter(&$libraries, $extension) {
+  // Add frontend theme to ckeditor5 iframe on the backend.
+  if ($extension === 'ckeditor5') {
+    $libraries['internal.drupal.ckeditor5.stylesheets']['css']['theme']['/modules/contrib/mbgna_tweaks/css/ckeditor5.css'] = [];
+  }
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter()
+ */
+function mbgna_tweaks_menu_local_tasks_alter(&$data, $route_name, RefinableCacheableDependencyInterface &$cacheability) {
+
+  if ($route_name === 'entity.user.canonical') {
+    $account = \Drupal::routeMatch()->getParameter('user');
+
+    $data['tabs'][0]['entity.user.canonical']['#link']['title'] = t('My dashboard');
+
+    $data['tabs'][0]['entity.user.edit_form']['#weight'] = -9;
+    $data['tabs'][0]['entity.user.edit_form']['#link']['title'] = t('My account');
+
+    $data['tabs'][0]['profile.user_page:personal']['#weight'] = -8;
+    $data['tabs'][0]['profile.user_page:personal']['#link']['title'] = t('My profile');
+
+    $data['tabs'][0]['commerce_order.address_book.overview']['#weight'] = -2;
+    $data['tabs'][0]['commerce_order.address_book.overview']['#link']['title'] = t('My addresses');
+
+    // Disabled on-site payment functionality in lieu of a hosted solution.
+    // Keep this commented-out function in case that changes later.
+    // Commerce's built-in payment method page is inadequate. Build a better page and
+    // override the default local task so it links to the custom page.
+    // $data['tabs'][0]['entity.commerce_payment_method.collection']['#weight'] = -5;
+    // $data['tabs'][0]['entity.commerce_payment_method.collection']['#link']['title'] = t('My payment methods');
+
+    // Disable payment method after switching to payment interstitual.
+    $data['tabs'][0]['entity.commerce_payment_method.collection']['#access'] = FALSE;
+
+    $data['tabs'][0]['views_view:view.commerce_user_orders.order_page']['#weight'] = -4;
+    $data['tabs'][0]['views_view:view.commerce_user_orders.order_page']['#link']['title'] = t('My orders');
+
+    $data['tabs'][0]['entity.user.contact_form']['#weight'] = -3;
+    $data['tabs'][0]['entity.user.contact_form']['#link']['title'] = t('Contact');
+
+    $data['tabs'][0]['entity.webform_submission.user']['#weight'] = 98;
+    if (!\Drupal::currentUser()->hasPermission('view any webform submission')) {
+      unset($data['tabs'][0]['entity.webform_submission.user']);  
+    }
+
+    $curr_user_cart_link = array(
+      '#theme' => 'menu_local_task',
+      '#link' => array(
+        'title' => t('My cart'),
+        'url' => Url::fromRoute('commerce_cart.page'),
+        'localized_options' => array(),
+      ),
+      '#active' => FALSE,
+      '#access' => TRUE,
+      '#weight' => -6,
+    );
+    $data['tabs'][0]['commerce_cart.page'] = $curr_user_cart_link;
+
+    $data['tabs'][0]['devel.entities:user.devel_tab']['#weight'] = 99;
+    $data['tabs'][0]['devel.entities:user.devel_tab']['#link']['title'] = t('Devel');
+
+    // The tab we're adding is dependent on a user's access to add content.
+    $cacheability
+      ->addCacheContexts([
+      'user.permissions',
+    ]);
+  }
+}
+
+// Disabled on-site payment functionality in lieu of a hosted solution.
+// Keep this commented-out function in case that changes later.
+// function mbgna_tweaks_menu_local_actions_alter(&$local_actions) {
+//   // Remove default "Add payment method" button on payment methods page.
+//   if (array_key_exists('entity.commerce_payment_method.add_form', $local_actions)) {
+//     unset($local_actions['entity.commerce_payment_method.add_form']);
+//   }
+// }
+
+function mbgna_tweaks_blazy_item_alter(array &$settings, array &$attributes, array &$item_attributes) {
+  $blazies = $settings['blazies'];
+  $blazies->set('item.title_tag', 'p');
+}
+
+/**
+ * Implements hook_form_webform_submission_form_alter()
+ */
+function mbgna_tweaks_webform_submission_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  // Move progress block from top to bottom of form if it exists.
+  if (array_key_exists('progress', $form) && array_key_exists('#weight', $form['progress']) && array_key_exists('#current_page', $form['progress'])) {
+    $form['progress']['#weight'] = 100;
+  }
+}
+
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function mbgna_tweaks_form_views_exposed_form_alter(&$form, $form_state, $form_id) {
+  if ($form['#id'] === 'views-exposed-form-events-page-1') {
+    $form['title']['#title_display'] = 'invisible';
+    $form['date_wrapper']['date_wrapper']['#title_display'] = 'invisible';
+
+    if (isset($form['categories'])) {
+      $form['categories']['#options']['All'] = t('Select a category...');
+    }
+    if (isset($form['location'])) {
+      $form['location']['#options']['All'] = t('Select a location...');
+    }
+  }
+
+  if ($form['#id'] === 'views-exposed-form-posts-page-1') {
+    $form['title']['#title_display'] = 'invisible';
+    $form['tags']['#title_display'] = 'invisible';
+  }
+
+  if ($form['#id'] === 'views-exposed-form-positions-page-1') {
+    $form['type']['#title_display'] = 'invisible';
+    $form['name']['#title_display'] = 'invisible';
+    $form['description']['#title_display'] = 'invisible';
+    $form['posted_wrapper']['posted_wrapper']['#title_display'] = 'invisible';
+  }
+
+  if ($form['#id'] === 'views-exposed-form-classes-page-1') {
+    $form['title']['#title_display'] = 'invisible';
+    $form['type']['#title_display'] = 'invisible';
+    $form['dates']['#title_display'] = 'invisible';
+    $form['institution']['#title_display'] = 'invisible';
+  }
+
+  if ($form['#id'] === 'views-exposed-form-organization-page-2') {
+    $form['label']['#title_display'] = 'invisible';
+  }
+
+  if ($form['#id'] === 'views-exposed-form-plant-block-2') {
+    $form['common_name']['#title_display'] = 'invisible';
+    $form['style']['#title_display'] = 'invisible';
+    $form['genus']['#title_display'] = 'invisible';
+    $form['species']['#title_display'] = 'invisible';
+  }
+
+  if ($form['#id'] === 'views-exposed-form-plant-block-4') {
+    $form['form']['#title_display'] = 'invisible';
+    $form['season']['#title_display'] = 'invisible';
+    $form['cultivar']['#title_display'] = 'invisible';
+    $form['country']['#title_display'] = 'invisible';
+  }
+
+  if ($form['#id'] === 'views-exposed-form-products-mbgna-page-1' || $form['#id'] === 'views-exposed-form-products-mbgna-page-2') {
+    $form['title']['#title_display'] = 'invisible';
+    $form['category']['#title_display'] = 'invisible';
+  }
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function mbgna_tweaks_user_update($account) {
+  $config_mbgna = \Drupal::config('mbgna_settings.settings');
+  $config_system = \Drupal::config('system.site');
+
+  // Send an internal email notification when a member changes their email address.
+  foreach ($account->getRoles() as $role) {
+    if (in_array($role, $config_mbgna->get('membership_user_roles'))) {
+      if ($account->original->getEmail() != $account->getEmail()) {
+        // Email
+        $email = $account->getEmail();
+
+        // Realname
+        $name_prefix_tid = $account->get('field_realname_prefix')->target_id;
+        if ($name_prefix_tid) {
+          $name_prefix_term = \Drupal\taxonomy\Entity\Term::load($name_prefix_tid);
+          $name_prefix = $name_prefix_term->getName() .' ';
+        }
+        $name_first = $account->get('field_realname_first')->value ? $account->get('field_realname_first')->value .' ' : '';
+        $name_middle = $account->get('field_realname_middle')->value ? $account->get('field_realname_middle')->value .' ' : '';
+        $name_last = $account->get('field_realname_last')->value; // no trailing space, suffix has leading space if suffix is present.
+        $name_suffix_tid = $account->get('field_realname_suffix')->target_id;
+        if ($name_suffix_tid) {
+          $name_suffix_term = \Drupal\taxonomy\Entity\Term::load($name_suffix_tid);
+          $name_suffix = $name_suffix_term->getName();
+        }
+        $full_name = $name_prefix . $name_first . $name_middle . $name_last . $name_suffix;
+
+        // Send email.
+        $to = $config_mbgna->get('member_activity_notification_email') ? $config_mbgna->get('member_activity_notification_email') : $config_system->get('mail');
+        $subject = 'Member account information change';
+        $message = 'A member ('. $account->getAccountName() .') has updated their account information. Email:'. $email .'; Full Name: '. $full_name;
+        mail($to, $subject, $message);
+
+        break; // Member role found. Terminate loop.
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_views_pre_render().
+ */
+function mbgna_tweaks_views_pre_render(ViewExecutable $view) {
+  // Ensure unique nodes.
+  if ($view->storage->get('id') === 'posts') {
+    $i = 0;
+    $nodes = [];
+    foreach ($view->result as $result) {
+      $entity = $result->_entity;
+      $nid = $entity->get('nid')->value;
+      if (in_array($nid, $nodes)) {
+        unset($view->result[$i]);
+      } else {
+        $nodes[] = $entity->get('nid')->value;
+      }
+      $i++;
+    }
+  }
+}
+
+/**
+ * Implements hook_js_alter().
+ */
+function mbgna_tweaks_js_alter(&$javascript, $extension) {
+  // Gin tries to load its admin-side js on the front end,
+  // which breaks js when it's included in the aggregation.
+  $excluded_files = [
+    'themes/contrib/gin/dist/js/sidebar.js',
+  ];
+
+  foreach ($javascript as $key => $file) {
+    if (in_array($file['data'], $excluded_files)) {
+      unset($javascript[$key]);
+    }
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function mbgna_tweaks_page_attachments(array &$attachments) {
+  $theme = \Drupal::theme()->getActiveTheme()->getName();
+  if ($theme == 'gin') {
+    $attachments['#attached']['library'][] = 'mbgna_tweaks/extra.admin';
+  }
+}
