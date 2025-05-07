@@ -28,6 +28,15 @@ function mbgna_tweaks_form_alter(&$form, FormStateInterface $form_state, $form_i
   $route_name = \Drupal::routeMatch()->getRouteName();
   $current_user = \Drupal::currentUser();
 
+  // Disable default user registration form only
+  // on the user registration page.
+  if ($form_id === 'user_register_form') {
+    $route_match = \Drupal::routeMatch();
+    if ($route_match->getRouteName() === 'user.register') {
+      $form['#access'] = FALSE;
+    }
+  }
+
   if ($form['#id'] === 'protected-pages-enter-password') {
     $form['#attributes']['class'][] = 'container-squeeze';
     $form['#attributes']['class'][] = 'container-white';
