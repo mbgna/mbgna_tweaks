@@ -736,7 +736,7 @@ function mbgna_tweaks_form_views_exposed_form_alter(&$form, $form_state, $form_i
       continue;
     }
 
-    if (in_array($element['#type'], ['textfield', 'select', 'radios', 'checkboxes', 'number'])) {
+    if (in_array($element['#type'], ['textfield', 'select', 'radios', 'checkboxes', 'number', 'date'])) {
       if (!empty($element['#description'])) {
         $element['#attributes']['aria-label'] = trim(strip_tags($element['#description']));
       }
